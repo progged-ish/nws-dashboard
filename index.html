@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NWS Forecast Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e; color: #eee; min-height: 100vh; padding: 20px;
+        }
+        .container { max-width: 1200px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 30px; color: #e94560; font-size: 2.5em; }
+        .grid { display: grid; gap: 20px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+        .card { 
+            background: #16213e; border-radius: 8px; padding: 20px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        }
+        .office-btn {
+            display: block; width: 100%; padding: 15px; margin-bottom: 10px;
+            background: #0f3460; color: #fff; border: none; border-radius: 6px;
+            cursor: pointer; font-size: 1.1em; transition: all 0.2s; text-align: left;
+        }
+        .office-btn:hover { background: #e94560; transform: translateX(5px); }
+        .office-btn.active { border-left: 4px solid #e94560; background: #1a3a7c; }
+        .loading { color: #888; font-style: italic; text-align: center; padding: 20px; }
+        .error { color: #ff6b6b; background: rgba(255,107,107,0.1); padding: 15px; border-radius: 6px; margin-top: 10px; }
+        .content-box { 
+            min-height: 300px; overflow-y: auto; max-height: calc(100vh - 200px);
+        }
+        .timestamp { color: #888; font-size: 0.9em; margin-bottom: 15px; }
+        pre { 
+            white-space: pre-wrap; word-wrap: break-word; line-height: 1.6;
+            background: #0f3460; padding: 20px; border-radius: 6px; color: #a8dadc;
+        }
+        .section-header { 
+            font-weight: bold; color: #e94560; margin-top: 15px; display: block;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>NWS Forecast Dashboard</h1>
+        
+        <div class="grid">
+            <!-- Office selection -->
+            <div>
+                <h2 style="margin-bottom: 15px;">Select Location</h2>
+                <button class="office-btn" onclick="loadDiscussion('TWC')">📍 Tucson, AZ</button>
+                <button class="office-btn" onclick="loadDiscussion('OKX')">📍 New York/Poughkeepsie, NY</button>
+                <button class="office-btn" onclick="loadDiscussion('PDX')">📍 Portland, OR</button>
+                <button class="office-btn" onclick="loadDiscussion('LAX')">📍 Los Angeles, CA</button>
+                <button class="office-btn" onclick="loadDiscussion('DEN')">📍 Denver, CO</button>
+            </div>
+            
+            <!-- Discussion display -->
+            <div>
+                <h2 style="margin-bottom: 15px;">Latest Discussion</h2>
+                <div id="discussion-content">
+                    <p class="loading">Select a location to view forecast discussion...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function loadDiscussion(office) {
+            const content = document.getElementById('discussion-content');
+            
+            // Update active button
+            document.querySelectorAll('.office-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            content.innerHTML = '<p class="loading">Loading...</p>';
+            
+            fetch(`/api/discussion/${office}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        content.innerHTML = `<div class="error">${data.error}</div>`;
+                    } else {
+                        const timestamp = new Date(data.issued).toLocaleString();
+                        let html = `
+                            <div class="timestamp">Issued: ${timestamp}</div>
+                            <pre>${formatDiscussion(data.discussion)}</pre>
+                        `;
+                        content.innerHTML = html;
+                    }
+                })
+                .catch(err => {
+                    content.innerHTML = `<div class="error">Error loading discussion: ${err.message}</div>`;
+                });
+        }
+        
+        function formatDiscussion(text) {
+            // Clean up the text and add formatting for sections
+            let formatted = text.replace(/^\n+|\n+$/g, '');
+            formatted = formatted.replace(/(\.SYNOPSIS|\.DISCUSSION|\.AVIATION|\.FIRE WEATHER)/g, '\n<span class="section-header">$1</span>');
+            return formatted;
+        }
+    </script>
+</body>
+</html>

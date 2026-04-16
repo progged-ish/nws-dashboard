@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+.env
+.venv/
+venv/
+env/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Logs & output
+*.log
+nohup.out
+dashboard.pid
+logs/
+
+# Data files
+*.grib2
+*.grib
+*.pkl
+*.parquet
+*.sqlite
+*.db
+
+# Cache
+.cache/
+node_modules/
+.npm/
+venv/
+__pycache__/
+*.pyc
+*.log
+nohup.out
+dashboard.pid
+.env
