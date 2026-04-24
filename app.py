@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """NWS Operations Dashboard — modern dark-mode HUD for AFD + NAM monitoring."""
 
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, render_template_string, jsonify, request, send_file
 import requests
 import os
 import glob
@@ -49,6 +49,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+# ── SOUNDERpy Blueprint ────────────────────────────────────────────────────────
+from sounderpy_routes import bp as sounderpy_bp
+app.register_blueprint(sounderpy_bp)
+
+MPH_PER_KT = 1.15078
 
 # ── State Cache ───────────────────────────────────────────────────────────────
 
@@ -1502,15 +1508,15 @@ EVENTS_HTML = r'''<!DOCTYPE html>
         <option value="ALL">ALL</option>
         <option value="SNOW">SNOW</option>
         <option value="SNOW_SQUALL">SNOW SQUALL</option>
-        <option value="WIND_GUST">WIND GUST</option>
-        <option value="TSTM_WIND_GUST">TSTM WIND GUST</option>
+        <option value="ADVISORY_WIND">ADVISORY WIND</option>
+        <option value="MDT_WIND">MDT WIND</option>
+        <option value="SVR_WIND">SVR WIND</option>
         <option value="HAIL">HAIL</option>
         <option value="TORNADO">TORNADO</option>
         <option value="FLASH_FLOOD">FLASH FLOOD</option>
         <option value="HEAVY_RAIN">HEAVY RAIN</option>
         <option value="FREEZING_RAIN">FREEZING RAIN</option>
         <option value="BLIZZARD">BLIZZARD</option>
-        <option value="HIGH_WIND">HIGH WIND</option>
       </select>
     </div>
     <div class="divider">|</div>
@@ -1561,6 +1567,8 @@ EVENTS_HTML = r'''<!DOCTYPE html>
     <div class="filter-group">
       <label>Days</label>
       <select id="fDays">
+        <option value="24h">24h</option>
+        <option value="48h">48h</option>
         <option value="7">7</option>
         <option value="14">14</option>
         <option value="30" selected>30</option>
@@ -1749,6 +1757,7 @@ function fmtTs(ts) {
 // ── Format magnitude ──
 function fmtMag(v, u) {
   if (v === null || v === undefined) return '—';
+  if (u === 'kt') return v.toFixed(0) + ' kt';
   if (u === 'mph') return v.toFixed(0) + ' mph';
   if (u === 'inches') return v.toFixed(2) + ' in';
   if (u === 'inches_per_hour') return v.toFixed(2) + ' in/hr';
@@ -1822,10 +1831,13 @@ function renderTable(events) {
 
   tbody.innerHTML = events.map(ev => {
     const cls = typeClass(ev.event_type);
-    const lbl = typeLabel(ev.event_type);
+    const displayType = ev.display_event_type || ev.event_type || ev.raw_type || '';
+    const windDisplayLabels = new Set(['Advisory', 'MDT Wind', 'SVR Wind']);
+    const lbl = windDisplayLabels.has(displayType) ? displayType : typeLabel(ev.event_type);
+    const detail = windDisplayLabels.has(displayType) ? '' : displayType;
     return `<tr>
       <td>${fmtTs(ev.timestamp)}</td>
-      <td><span class="type-pill ${cls}">${lbl}</span>&nbsp;<span style="color:var(--text-dim);font-size:0.85em">${ev.event_type || ev.raw_type || ''}</span></td>
+      <td><span class="type-pill ${cls}">${lbl}</span>${detail ? `&nbsp;<span style="color:var(--text-dim);font-size:0.85em">${detail}</span>` : ''}</td>
       <td class="mag">${fmtMag(ev.magnitude, ev.magnitude_unit)}</td>
       <td>${ev.latitude?.toFixed(3)}, ${ev.longitude?.toFixed(3)} <span class="dist">(${ev.distance_mi} mi)</span></td>
       <td><span class="site-id">${ev.site_id}</span> <span class="state-badge">${ev.state || ''}</span></td>
@@ -1923,6 +1935,78 @@ def _zulu_now():
     return datetime.utcnow().strftime("%Y%m%d %H%MZ")
 
 
+def _parse_days_arg(days_arg: str):
+    token = (days_arg or "30").strip().lower()
+    if token == "all":
+        return "all", None, None
+    if token.endswith("h"):
+        try:
+            hours = int(token[:-1])
+            return token, None, hours
+        except ValueError:
+            return "30", 30, None
+    try:
+        days = int(token)
+        return token, days, None
+    except ValueError:
+        return "30", 30, None
+
+
+def _mph_to_kt(mph):
+    if mph is None:
+        return None
+    return int(round(float(mph) / MPH_PER_KT))
+
+
+def _classify_wind_event(event_type, magnitude, magnitude_unit):
+    convective_types = {"TSTM_WIND_GUST", "MARINE_TSTM_WIND"}
+    non_convective_types = {"WIND_GUST", "HIGH_WIND", "METAR_PEAK_GUST", "NON_TSTM_WIND_GUST"}
+    wind_types = convective_types | non_convective_types
+    if event_type not in wind_types:
+        return None
+
+    unit = (magnitude_unit or "").lower()
+    magnitude_kt = None
+    if magnitude is not None:
+        if unit == "mph":
+            magnitude_kt = _mph_to_kt(magnitude)
+        elif unit in {"kt", "kts", "knot", "knots"}:
+            magnitude_kt = int(round(float(magnitude)))
+
+    display_type = "Wind"
+    filter_type = event_type
+    if magnitude_kt is not None:
+        if 25 <= magnitude_kt <= 34:
+            display_type = "Advisory"
+            filter_type = "ADVISORY_WIND"
+        elif 35 <= magnitude_kt <= 49:
+            display_type = "MDT Wind"
+            filter_type = "MDT_WIND"
+        elif magnitude_kt >= 50:
+            display_type = "SVR Wind"
+            filter_type = "SVR_WIND"
+
+    return {
+        "display_event_type": display_type,
+        "filter_event_type": filter_type,
+        "magnitude": magnitude_kt if magnitude_kt is not None else magnitude,
+        "magnitude_unit": "kt" if magnitude_kt is not None else magnitude_unit,
+    }
+
+
+def _enrich_event_display(event):
+    wind_meta = _classify_wind_event(
+        event.get("event_type"),
+        event.get("magnitude"),
+        event.get("magnitude_unit"),
+    )
+    if wind_meta:
+        event.update(wind_meta)
+    else:
+        event["display_event_type"] = event.get("event_type") or event.get("raw_type")
+    return event
+
+
 def _wx_conn():
     """Open a connection to the WX events database."""
     import sqlite3
@@ -1998,10 +2082,7 @@ def api_events():
         site_id = request.args.get("site")
         state = request.args.get("state")
         days_arg = request.args.get("days", "30")
-        if days_arg == "all":
-            days = None  # No date cutoff
-        else:
-            days = int(days_arg)
+        normalized_days, days, hours = _parse_days_arg(days_arg)
         limit = int(request.args.get("limit", 200))
         offset = int(request.args.get("offset", 0))
 
@@ -2025,20 +2106,49 @@ def api_events():
         if start_date:
             where.append("e.timestamp >= ?")
             params.append(start_date + "T00:00:00+00:00")
+        elif hours is not None:
+            cutoff = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+            where.append("e.timestamp >= ?")
+            params.append(cutoff)
         elif days is not None:
             cutoff = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
             where.append("e.timestamp >= ?")
             params.append(cutoff)
-        # If no start_date and days is None, no cutoff applied
+        # If no start_date and no relative range, no cutoff applied
 
         if end_date:
             where.append("e.timestamp <= ?")
             params.append(end_date + "T23:59:59+00:00")
 
         # Event type
+        threshold_wind_filters = {
+            "ADVISORY_WIND": (25, 34),
+            "MDT_WIND": (35, 49),
+            "SVR_WIND": (50, None),
+        }
+        wind_event_types = (
+            "TSTM_WIND_GUST",
+            "MARINE_TSTM_WIND",
+            "WIND_GUST",
+            "HIGH_WIND",
+            "METAR_PEAK_GUST",
+            "NON_TSTM_WIND_GUST",
+        )
         if event_type and event_type != "ALL":
-            where.append("e.event_type = ?")
-            params.append(event_type)
+            if event_type in threshold_wind_filters:
+                min_kt, max_kt = threshold_wind_filters[event_type]
+                magnitude_kt_expr = "CASE WHEN lower(COALESCE(e.magnitude_unit, '')) = 'mph' THEN ROUND(e.magnitude / ?) WHEN lower(COALESCE(e.magnitude_unit, '')) IN ('kt', 'kts', 'knot', 'knots') THEN ROUND(e.magnitude) ELSE NULL END"
+                wind_placeholders = ", ".join("?" for _ in wind_event_types)
+                where.append(f"e.event_type IN ({wind_placeholders})")
+                params.extend(wind_event_types)
+                where.append(f"{magnitude_kt_expr} >= ?")
+                params.extend([MPH_PER_KT, min_kt])
+                if max_kt is not None:
+                    where.append(f"{magnitude_kt_expr} <= ?")
+                    params.extend([MPH_PER_KT, max_kt])
+            else:
+                where.append("e.event_type = ?")
+                params.append(event_type)
 
         # Site filter
         if site_id and site_id != "ALL":
@@ -2058,7 +2168,7 @@ def api_events():
             where.append("e.distance_mi <= ?")
             params.append(float(max_distance))
 
-        where_clause = " AND ".join(where)
+        where_clause = " AND ".join(where) if where else "1=1"
 
         # ── Sort clause ────────────────────────────────────────────────────────
         sort_col_map = {
@@ -2099,7 +2209,7 @@ def api_events():
             LIMIT ? OFFSET ?
         """, params + [limit, offset]).fetchall()
 
-        events = [dict(r) for r in rows]
+        events = [_enrich_event_display(dict(r)) for r in rows]
 
         return jsonify({
             "events": events,
@@ -2110,7 +2220,7 @@ def api_events():
                 "type": event_type or "ALL",
                 "site": site_id or "ALL",
                 "state": state or "ALL",
-                "days": days,
+                "days": normalized_days,
                 "start_date": start_date or "",
                 "end_date": end_date or "",
                 "min_dist": min_distance or "",
@@ -2332,8 +2442,9 @@ THREATS_HTML = r'''
 
   /* ── Tooltip ── */
   .cell .tip {
-    display: none; position: absolute; z-index: 100;
-    top: 110%; left: 50%; transform: translateX(-50%);
+    display: none; position: fixed; z-index: 1000;
+    top: var(--tip-top, 0); left: var(--tip-left, 0);
+    transform: translateX(-50%);
     background: var(--bg-panel); border: 1px solid var(--border); border-radius: 6px;
     padding: 10px 14px; font-size: 0.75em; line-height: 1.7;
     white-space: nowrap; pointer-events: none;
@@ -2345,7 +2456,7 @@ THREATS_HTML = r'''
     border-bottom-color: var(--border);
   }
   .cell .tip.flip {
-    top: auto; bottom: 110%;
+    top: var(--tip-top, 0);
   }
   .cell .tip.flip::after {
     bottom: auto; top: 100%;
@@ -2544,13 +2655,29 @@ function render() {
     cell.addEventListener('mouseenter', () => {
       const tip = cell.querySelector('.tip');
       if (!tip) return;
-      const rect = cell.getBoundingClientRect();
-      const tipH = tip.offsetHeight || 200;
-      tip.classList.toggle('flip', rect.bottom + tipH > window.innerHeight);
+      // Position with fixed coordinates via CSS variables
+      const cellRect = cell.getBoundingClientRect();
+      const tipX = cellRect.left + cellRect.width / 2;
+      let tipY = cellRect.bottom + 8;
+      tip.style.setProperty('--tip-left', tipX + 'px');
+
+      // Measure height to decide flip
+      const oldDisplay = tip.style.display;
+      const oldVis = tip.style.visibility;
+      tip.style.visibility = 'hidden';
+      tip.style.display = 'block';
+      const tipH = tip.offsetHeight || 220;
+      tip.style.display = oldDisplay || '';
+      tip.style.visibility = oldVis || '';
+
+      const flip = (tipY + tipH > window.innerHeight);
+      tip.classList.toggle('flip', flip);
+      tipY = flip ? (cellRect.top - 8 - tipH) : tipY;
+      tip.style.setProperty('--tip-top', tipY + 'px');
     });
     cell.addEventListener('mouseleave', () => {
       const tip = cell.querySelector('.tip');
-      if (tip) tip.classList.remove('flip');
+      if (tip) { tip.classList.remove('flip'); tip.style.removeProperty('--tip-top'); tip.style.removeProperty('--tip-left'); }
     });
   });
 }
@@ -3037,6 +3164,586 @@ init();
 # ── SkewT Template ──────────────────────────────────────────────────────────────
 
 SKEWT_HTML = r'''
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NAM SkewT Soundings</title>
+<style>
+  :root {
+    --bg-deep: #0a0e17;
+    --bg-panel: #111827;
+    --bg-card: #1a2332;
+    --border: #2a3a4e;
+    --text: #e2e8f0;
+    --text-dim: #64748b;
+    --accent: #38bdf8;
+    --accent2: #818cf8;
+    --green: #34d399;
+    --red: #f87171;
+    --amber: #fbbf24;
+    --orange: #fb923c;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    background: var(--bg-deep); color: var(--text); min-height: 100vh;
+  }
+  .hud { max-width: 1400px; margin: 0 auto; padding: 16px; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; margin-bottom: 16px;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .topbar-left { display: flex; align-items: center; gap: 12px; }
+  .topbar-title { font-size: 1.1em; font-weight: 700; letter-spacing: 2px; color: var(--accent); }
+  .topbar-sub { font-size: 0.75em; color: var(--text-dim); letter-spacing: 1px; }
+  .topbar-right { display: flex; align-items: center; gap: 16px; font-size: 0.8em; color: var(--text-dim); }
+  .pulse { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+  .pulse-ok { background: var(--green); box-shadow: 0 0 6px var(--green); }
+
+  .controls {
+    display: flex; gap: 12px; align-items: center; flex-wrap: wrap;
+    padding: 12px 16px; margin-bottom: 16px;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+  }
+  .controls label { font-size: 0.75em; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; }
+  .controls select, .controls input {
+    background: var(--bg-card); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 12px; border-radius: 6px; font-family: inherit; font-size: 0.8em;
+  }
+  .controls select:focus, .controls input:focus { border-color: var(--accent); outline: none; }
+  .btn {
+    padding: 6px 16px; border-radius: 6px; font-family: inherit; font-size: 0.75em;
+    font-weight: 600; letter-spacing: 1px; cursor: pointer; border: 1px solid var(--border);
+    background: var(--bg-card); color: var(--text-dim); transition: all 0.2s;
+  }
+  .btn:hover { border-color: var(--accent); color: var(--accent); }
+  .btn.active { background: rgba(56,189,248,0.12); border-color: var(--accent); color: var(--accent); }
+  .btn-group { display:flex; gap:6px; }
+
+  .skewt-container {
+    display: flex; gap: 16px;
+  }
+  .skewt-left { flex: 1; }
+  .skewt-right { width: 320px; }
+
+  .panel {
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
+    overflow: hidden;
+  }
+  .panel-head {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    background: rgba(56,189,248,0.04);
+  }
+  .panel-head h2 { font-size: 0.85em; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; color: var(--accent); }
+  .panel-pill {
+    font-size: 0.7em; padding: 2px 10px; border-radius: 12px;
+    font-weight: 600; letter-spacing: 1px;
+  }
+  .pill-info { background: rgba(56,189,248,0.15); color: var(--accent); }
+  .pill-ok { background: rgba(52,211,153,0.15); color: var(--green); }
+  .panel-body { padding: 16px; }
+
+  .sounder-img {
+    display: block; width: 100%; max-width: 900px;
+    border: 1px solid var(--border); border-radius: 6px; background: #0d1117;
+  }
+  .sounder-img.loading {
+    opacity: 0.4;
+    background: repeating-linear-gradient(
+      45deg, #0d1117 0, #0d1117 10px, #161b22 10px, #161b22 20px
+    );
+  }
+
+  .sounding-list { max-height: 600px; overflow-y: auto; }
+  .sounding-item {
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+    cursor: pointer; font-size: 0.78em; transition: all 0.15s;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .sounding-item:hover { background: rgba(56,189,248,0.06); }
+  .sounding-item.active { background: rgba(56,189,248,0.12); color: var(--accent); }
+  .sounding-code { font-weight: 700; letter-spacing: 1px; }
+  .sounding-name { color: var(--text-dim); font-size: 0.85em; }
+
+  .params-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+  }
+  .param-card {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px;
+  }
+  .param-label { font-size: 0.65em; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; }
+  .param-value { font-size: 1.1em; font-weight: 700; color: var(--accent); margin-top: 2px; }
+  .param-unit { font-size: 0.7em; color: var(--text-dim); font-weight: 400; }
+
+  .fh-slider { width: 100%; margin-top: 8px; }
+  .fh-slider input[type=range] {
+    width: 100%; background: var(--bg-card); accent-color: var(--accent);
+  }
+  .fh-labels {
+    display: flex; justify-content: space-between; font-size: 0.65em; color: var(--text-dim);
+  }
+
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .back-link { font-size: 0.8em; }
+
+  canvas { display: block; border: 1px solid var(--border); border-radius: 6px; background: #0d1117; }
+  .skewt-img-wrap { position: relative; }
+  .skewt-spinner {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    font-size: 0.75em; color: var(--accent); letter-spacing: 2px;
+    display: none; z-index: 2;
+  }
+  .skewt-img-wrap.loading .skewt-spinner { display: block; }
+  .skewt-img-wrap.loading .sounder-img { opacity: 0.4; }
+</style>
+</head>
+<body>
+<div class="hud">
+  <div class="topbar">
+    <div class="topbar-left">
+      <a href="/" class="back-link">◀ DASHBOARD</a>
+      <span class="topbar-title">NAM SKEW-T</span>
+      <span class="topbar-sub" id="cycleLabel">loading...</span>
+    </div>
+    <div class="topbar-right">
+      <span><span class="pulse pulse-ok"></span>LIVE</span>
+      <span id="clock"></span>
+    </div>
+  </div>
+
+  <div class="controls">
+    <div>
+      <label>STATION</label><br>
+      <select id="stationSelect"><option>Loading...</option></select>
+    </div>
+    <div>
+      <label>FORECAST HOUR</label><br>
+      <select id="fhourSelect"></select>
+    </div>
+    <div class="fh-slider">
+      <input type="range" id="fhourSlider" min="0" max="84" step="3" value="0">
+      <div class="fh-labels"><span>f00</span><span>f84</span></div>
+    </div>
+    <div class="btn-group">
+      <button id="toggleLegacy" class="btn">Legacy Canvas</button>
+    </div>
+  </div>
+
+  <div class="skewt-container">
+    <div class="skewt-left">
+
+      <!-- SOUNDERpy server-rendered images -->
+      <div class="panel" id="sounderPanel">
+        <div class="panel-head">
+          <h2>SOUNDING</h2>
+          <span class="panel-pill pill-info" id="soundingLabel">—</span>
+        </div>
+        <div class="panel-body">
+          <div class="skewt-img-wrap" id="imgWrap">
+            <img id="skewtImg" class="sounder-img" src="" alt="Skew-T">
+            <div class="skewt-spinner">RENDERING…</div>
+          </div>
+          <div class="skewt-img-wrap" id="hodoWrap" style="margin-top:16px;">
+            <img id="hodoImg" class="sounder-img" src="" alt="Hodograph">
+            <div class="skewt-spinner">RENDERING…</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Legacy Canvas — hidden by default -->
+      <div class="panel" id="legacyPanel" style="display:none;">
+        <div class="panel-head">
+          <h2>SOUNDING (LEGACY)</h2>
+          <span class="panel-pill pill-info" id="legacyLabel">f00</span>
+        </div>
+        <div class="panel-body">
+          <canvas id="skewtCanvas" width="750" height="600"></canvas>
+        </div>
+      </div>
+
+    </div>
+    <div class="skewt-right">
+      <div class="panel" style="margin-bottom:16px">
+        <div class="panel-head">
+          <h2>PARAMETERS</h2>
+          <span class="panel-pill pill-ok" id="validTime">—</span>
+        </div>
+        <div class="panel-body">
+          <div class="params-grid" id="paramsGrid"></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-head">
+          <h2>STATIONS</h2>
+          <span class="panel-pill pill-info" id="stationCount">—</span>
+        </div>
+        <div class="panel-body sounding-list" id="stationList"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Global State ──────────────────────────────────────────────
+let profileData = null;
+let stationList = [];
+let cycleInfo = {};
+let currentStation = null;
+let currentFhour = 'f00';
+let useLegacy = false;
+
+// ── API Fetch ─────────────────────────────────────────────────
+async function loadProfiles() {
+  const resp = await fetch('/api/nam/profiles');
+  const data = await resp.json();
+  cycleInfo = data.info;
+  stationList = data.stations;
+  document.getElementById('cycleLabel').textContent = cycleInfo.cycle + ' | ' + cycleInfo.model;
+  document.getElementById('stationCount').textContent = stationList.length + ' stations';
+
+  // Populate station dropdown
+  const sel = document.getElementById('stationSelect');
+  sel.innerHTML = '';
+  stationList.forEach(s => {
+    const opt = document.createElement('option');
+    opt.value = s.code;
+    opt.textContent = s.code + ' — ' + s.name;
+    sel.appendChild(opt);
+  });
+
+  // Populate forecast hours
+  const fhSel = document.getElementById('fhourSelect');
+  fhSel.innerHTML = '';
+  cycleInfo.forecast_hours.forEach(fh => {
+    const key = 'f' + String(fh).padStart(2, '0');
+    const opt = document.createElement('option');
+    opt.value = key; opt.textContent = 'f' + fh;
+    fhSel.appendChild(opt);
+  });
+
+  // Station list sidebar
+  const list = document.getElementById('stationList');
+  list.innerHTML = '';
+  stationList.forEach(s => {
+    const div = document.createElement('div');
+    div.className = 'sounding-item';
+    div.innerHTML = '<span class="sounding-code">' + s.code + '</span><span class="sounding-name">' + s.name + '</span>';
+    div.onclick = () => { selectStation(s.code); };
+    list.appendChild(div);
+  });
+
+  // Pick first station
+  if (stationList.length > 0) selectStation(stationList[0].code);
+}
+
+async function selectStation(code) {
+  currentStation = code;
+  document.getElementById('stationSelect').value = code;
+
+  // Highlight in sidebar
+  document.querySelectorAll('.sounding-item').forEach(el => {
+    el.classList.toggle('active', el.querySelector('.sounding-code').textContent === code);
+  });
+
+  const resp = await fetch('/api/nam/profiles/' + code);
+  profileData = await resp.json();
+  selectFhour(currentFhour);
+}
+
+function selectFhour(key) {
+  currentFhour = key;
+  document.getElementById('fhourSelect').value = key;
+  const fhNum = parseInt(key.replace('f', ''));
+  document.getElementById('fhourSlider').value = fhNum;
+
+  if (!profileData || !profileData.forecast_hours[key]) return;
+
+  const sounding = profileData.forecast_hours[key];
+  updateParams(sounding, key);
+  document.getElementById('soundingLabel').textContent = profileData.code + ' ' + key.toUpperCase();
+  document.getElementById('legacyLabel').textContent = profileData.code + ' ' + key.toUpperCase();
+
+  if (useLegacy) {
+    drawSkewT(sounding);
+    return;
+  }
+
+  // Update image sources with bust cache
+  const cycle = (cycleInfo.cycle || '').replace(/ /g, '_');
+  const bust = Date.now();
+  const skewtSrc = '/api/sounderpy/skewt?station=' + encodeURIComponent(currentStation)
+    + '&cycle=' + encodeURIComponent(cycle)
+    + '&fh=' + encodeURIComponent(currentFhour)
+    + '&_=' + bust;
+  const hodoSrc = '/api/sounderpy/hodograph?station=' + encodeURIComponent(currentStation)
+    + '&cycle=' + encodeURIComponent(cycle)
+    + '&fh=' + encodeURIComponent(currentFhour)
+    + '&_=' + bust;
+
+  const skewtImg = document.getElementById('skewtImg');
+  const hodoImg = document.getElementById('hodoImg');
+  const imgWrap = document.getElementById('imgWrap');
+  const hodoWrap = document.getElementById('hodoWrap');
+
+  imgWrap.classList.add('loading');
+  hodoWrap.classList.add('loading');
+
+  skewtImg.onload = () => { imgWrap.classList.remove('loading'); };
+  skewtImg.onerror = () => { imgWrap.classList.remove('loading'); };
+  hodoImg.onload = () => { hodoWrap.classList.remove('loading'); };
+  hodoImg.onerror = () => { hodoWrap.classList.remove('loading'); };
+
+  skewtImg.src = skewtSrc;
+  hodoImg.src = hodoSrc;
+
+  // Fallback: if images fail after 10s, auto-switch to legacy
+  setTimeout(() => {
+    if (imgWrap.classList.contains('loading')) {
+      skewtImg.onerror = null;
+      hodoImg.onerror = null;
+      imgWrap.classList.remove('loading');
+      hodoWrap.classList.remove('loading');
+      toggleLegacy(true);
+    }
+  }, 10000);
+}
+
+// ── Legacy toggle ─────────────────────────────────────────────
+function toggleLegacy(forceOn) {
+  const btn = document.getElementById('toggleLegacy');
+  useLegacy = forceOn !== undefined ? forceOn : !useLegacy;
+  btn.classList.toggle('active', useLegacy);
+
+  document.getElementById('sounderPanel').style.display = useLegacy ? 'none' : '';
+  document.getElementById('legacyPanel').style.display = useLegacy ? '' : 'none';
+
+  if (useLegacy && profileData) {
+    drawSkewT(profileData.forecast_hours[currentFhour]);
+  }
+}
+
+document.getElementById('toggleLegacy').addEventListener('click', () => toggleLegacy());
+
+// ── Parameter Display ─────────────────────────────────────────
+function updateParams(sounding, fhKey) {
+  const sfc = sounding.surface;
+  const levels = sounding.levels;
+
+  // Find significant levels
+  const l850 = levels.find(l => l.hPa === 850) || {};
+  const l700 = levels.find(l => l.hPa === 700) || {};
+  const l500 = levels.find(l => l.hPa === 500) || {};
+  const l300 = levels.find(l => l.hPa === 300) || {};
+
+  // Find max wind
+  let maxWind = 0, maxWindLevel = 0;
+  levels.forEach(l => {
+    const wspd = l.wind_spd_ms * 1.94384; // m/s to kt
+    if (wspd > maxWind) { maxWind = wspd; maxWindLevel = l.hPa; }
+  });
+
+  // Compute LCL estimate (simple: 125m per degC dewpoint depression)
+  const sfcTd = sfc.temp_C - (100 - (sfc.rh_pct || (levels.length > 0 ? levels[0].rh_pct : 50))) / 5;
+  const dep = sfc.temp_C - sfcTd;
+  const lclHpa = Math.round(sfc.pressure_hPa - dep * 12);
+
+  const params = [
+    {label: 'SFC TEMP', value: sfc.temp_C, unit: '°C'},
+    {label: 'SFC DEWP', value: (sfc.temp_C - (100 - (sfc.rh_pct || (levels.length > 0 ? levels[0].rh_pct : 50)))/5).toFixed(1), unit: '°C'},
+    {label: 'SFC PRES', value: Math.round(sfc.pressure_hPa), unit: 'hPa'},
+    {label: 'SFC RH', value: (sfc.rh_pct || '—'), unit: '%'},
+    {label: '850mb T', value: (l850.temp_C || '—'), unit: '°C'},
+    {label: '700mb T', value: (l700.temp_C || '—'), unit: '°C'},
+    {label: '500mb T', value: (l500.temp_C || '—'), unit: '°C'},
+    {label: '300mb T', value: (l300.temp_C || '—'), unit: '°C'},
+    {label: '850mb RH', value: (l850.rh_pct || '—'), unit: '%'},
+    {label: '700mb RH', value: (l700.rh_pct || '—'), unit: '%'},
+    {label: 'MAX WIND', value: maxWind.toFixed(0), unit: 'kt'},
+    {label: 'MAX W LVL', value: maxWindLevel, unit: 'hPa'},
+  ];
+
+  const grid = document.getElementById('paramsGrid');
+  grid.innerHTML = '';
+  params.forEach(p => {
+    const div = document.createElement('div');
+    div.className = 'param-card';
+    div.innerHTML = '<div class="param-label">' + p.label + '</div>' +
+      '<div class="param-value">' + p.value + ' <span class="param-unit">' + p.unit + '</span></div>';
+    grid.appendChild(div);
+  });
+
+  const fhNum = parseInt(fhKey.replace('f', ''));
+  if (cycleInfo.cycle_date && cycleInfo.cycle_hour !== undefined) {
+    const base = new Date(cycleInfo.cycle_date.slice(0,4) + '-' +
+      cycleInfo.cycle_date.slice(4,6) + '-' + cycleInfo.cycle_date.slice(6,8) + 'T' +
+      String(cycleInfo.cycle_hour).padStart(2,'0') + ':00:00Z');
+    const valid = new Date(base.getTime() + fhNum * 3600000);
+    document.getElementById('validTime').textContent = valid.toISOString().slice(0,16) + 'Z';
+  }
+}
+
+// ── Legacy Canvas SkewT Drawing ────────────────────────────────
+function drawSkewT(sounding) {
+  const canvas = document.getElementById('skewtCanvas');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+
+  const ml = 65, mr = 40, mt = 30, mb = 50;
+  const pw = W - ml - mr, ph = H - mt - mb;
+  const P_TOP = 100, P_BOT = 1050;
+  function pToY(p) {
+    return mt + ph * (Math.log(P_BOT) - Math.log(p)) / (Math.log(P_BOT) - Math.log(P_TOP));
+  }
+  const T_MIN = -50, T_MAX = 45;
+  const SKEW = 0.4;
+  function tToX(t, p) {
+    const skewOffset = SKEW * (Math.log(P_BOT) - Math.log(p));
+    return ml + pw * ((t + skewOffset) - T_MIN) / (T_MAX - T_MIN);
+  }
+
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 1; ctx.fillStyle = '#475569';
+  ctx.font = '11px monospace'; ctx.textAlign = 'right';
+  [1000,850,700,500,400,300,250,200,150,100].forEach(p => {
+    if (p < P_TOP || p > P_BOT) return;
+    const y = pToY(p);
+    ctx.beginPath(); ctx.moveTo(ml, y); ctx.lineTo(W - mr, y); ctx.stroke();
+    ctx.fillText(p, ml - 6, y + 4);
+  });
+
+  ctx.strokeStyle = '#1e293b'; ctx.lineWidth = 0.5;
+  for (let t = T_MIN; t <= T_MAX; t += 10) {
+    ctx.beginPath();
+    ctx.moveTo(tToX(t, P_BOT), pToY(P_BOT));
+    ctx.lineTo(tToX(t, P_TOP), pToY(P_TOP));
+    ctx.stroke();
+    ctx.fillStyle = '#475569'; ctx.textAlign = 'center';
+    ctx.fillText(t + '°', tToX(t, P_BOT), pToY(P_BOT) + 16);
+  }
+
+  ctx.strokeStyle = '#1a3329'; ctx.lineWidth = 0.5;
+  for (let theta = -30; theta <= 60; theta += 10) {
+    ctx.beginPath();
+    let first = true;
+    for (let p = P_BOT; p >= P_TOP; p -= 20) {
+      const tC = (theta + 273.15) * (p / 1000) ** 0.286 - 273.15;
+      const x = tToX(tC, p), y = pToY(p);
+      if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  const levels = sounding.levels;
+  if (!levels || levels.length === 0) return;
+
+  ctx.strokeStyle = '#f87171'; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  let first = true;
+  levels.forEach(l => {
+    if (l.hPa < P_TOP || l.hPa > P_BOT) return;
+    const x = tToX(l.temp_C, l.hPa), y = pToY(l.hPa);
+    if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  ctx.strokeStyle = '#34d399'; ctx.lineWidth = 2.5;
+  ctx.beginPath();
+  first = true;
+  levels.forEach(l => {
+    if (l.hPa < P_TOP || l.hPa > P_BOT) return;
+    const td = l.temp_C - (100 - l.rh_pct) / 5;
+    const x = tToX(td, l.hPa), y = pToY(l.hPa);
+    if (first) { ctx.moveTo(x, y); first = false; } else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+
+  const barbX = W - mr - 5;
+  ctx.strokeStyle = '#94a3b8'; ctx.fillStyle = '#94a3b8'; ctx.lineWidth = 1.2;
+  levels.forEach(l => {
+    if (l.hPa < P_TOP || l.hPa > P_BOT) return;
+    const y = pToY(l.hPa);
+    const spd = l.wind_spd_ms * 1.94384;
+    const dir = l.wind_dir;
+    drawWindBarb(ctx, barbX, y, spd, dir);
+  });
+
+  const sfc = sounding.surface;
+  if (sfc) {
+    ctx.fillStyle = '#f87171';
+    ctx.beginPath(); ctx.arc(tToX(sfc.temp_C, sfc.pressure_hPa), pToY(sfc.pressure_hPa), 4, 0, Math.PI * 2); ctx.fill();
+    const td = sfc.temp_C - (100 - (sfc.rh_pct || (levels.length > 0 ? levels[0].rh_pct : 50))) / 5;
+    ctx.fillStyle = '#34d399';
+    ctx.beginPath(); ctx.arc(tToX(td, sfc.pressure_hPa), pToY(sfc.pressure_hPa), 4, 0, Math.PI * 2); ctx.fill();
+  }
+
+  ctx.font = '12px monospace';
+  ctx.fillStyle = '#f87171'; ctx.fillText('— T', 80, H - 10);
+  ctx.fillStyle = '#34d399'; ctx.fillText('— Td', 140, H - 10);
+  ctx.fillStyle = '#94a3b8'; ctx.fillText('☊ Wind', 200, H - 10);
+  ctx.save(); ctx.translate(14, mt + ph / 2); ctx.rotate(-Math.PI / 2);
+  ctx.fillStyle = '#64748b'; ctx.font = '12px monospace'; ctx.textAlign = 'center';
+  ctx.fillText('PRESSURE (hPa)', 0, 0); ctx.restore();
+  ctx.fillStyle = '#64748b'; ctx.textAlign = 'center';
+  ctx.fillText('TEMPERATURE (°C)', ml + pw / 2, H - 4);
+}
+
+function drawWindBarb(ctx, x, y, spd_kt, dir_deg) {
+  const r = 14;
+  const ang = (dir_deg - 180) * Math.PI / 180;
+  const ex = x - r * Math.sin(ang);
+  const ey = y - r * Math.cos(ang);
+  ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(ex, ey); ctx.stroke();
+  const barbLen = 7;
+  const ticks = Math.floor(spd_kt / 10);
+  for (let i = 0; i < Math.min(ticks, 4); i++) {
+    const frac = 0.3 + i * 0.2;
+    const tx = ex + (x - ex) * frac;
+    const ty = ey + (y - ey) * frac;
+    const side = (i % 2 === 0) ? 1 : -1;
+    ctx.beginPath(); ctx.moveTo(tx, ty);
+    ctx.lineTo(tx + side * barbLen * Math.cos(ang - Math.PI/4), ty + side * barbLen * Math.sin(ang - Math.PI/4));
+    ctx.stroke();
+  }
+}
+
+// ── Event Handlers ─────────────────────────────────────────────
+document.getElementById('stationSelect').addEventListener('change', e => {
+  selectStation(e.target.value);
+});
+document.getElementById('fhourSelect').addEventListener('change', e => {
+  selectFhour(e.target.value);
+});
+document.getElementById('fhourSlider').addEventListener('input', e => {
+  const fh = parseInt(e.target.value);
+  const key = 'f' + String(fh).padStart(2, '0');
+  if (cycleInfo.forecast_hours.includes(fh)) {
+    selectFhour(key);
+  }
+});
+
+// Clock
+function updateClock() {
+  document.getElementById('clock').textContent = new Date().toISOString().slice(0,19) + 'Z';
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// Init
+loadProfiles();
+</script>
+</body>
+</html>
+'''
+
+DASHBOARD_HTML = r'''
 <!DOCTYPE html>
 <html lang="en">
 <head>

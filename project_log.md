@@ -44,3 +44,27 @@ cfgrib has a silent failure mode: opening `paramId=[131,132]` (u+v together) fro
 ### Status
 - Wind data flows again, BTW computes, threat icons render
 - Full change-log entry at `~/.hermes/change-logs/nam-threats/2026-04-15.md`
+
+## 2026-04-17 — WX Events live-source-path handoff
+
+Investigated the current `/events` implementation to avoid patching the wrong app again.
+
+### Confirmed live paths
+- Live events page is served from `http://localhost:5000/events`
+- Live Flask source is `/home/progged-ish/nws_dashboard/app.py`
+- Event database in use is `/home/progged-ish/wx_events/wx_events.db`
+- Legacy standalone `wx_events` app is not the active web source for the current dashboard page
+
+### User-requested pending changes
+- Add `24h` and `48h` options to the events time filter
+- Display wind magnitudes in `KT` on the web page
+- Re-label wind event types by knot thresholds for both convective and non-convective winds:
+  - `25–34 KT` → `Advisory`
+  - `35–49 KT` → `Air Force Moderate`
+  - `50+ KT` → `Air Force Severe`
+
+### Current state
+- Root cause of repeated recap loop was context churn before code patching began
+- No live code changes applied yet for the requested `/events` UI/type updates
+- Next session should patch `nws_dashboard/app.py`, then verify against live `/api/events` and `/events` on port 5000
+- Dashboard PID file currently records `8050` in `/home/progged-ish/nws_dashboard/dashboard.pid`
