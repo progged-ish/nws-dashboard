@@ -4,6 +4,7 @@ Routes:
     GET /api/sounderpy/skewt?station=<code>&cycle=<cycle>&fh=<fh>
     GET /api/sounderpy/hodograph?station=<code>&cycle=<cycle>&fh=<fh>
     GET /api/sounderpy/raob?station=<id>&date=<YYYYmmdd>&hour=<HH>
+    GET /api/sounderpy/cache/status
 """
 import os
 import glob
@@ -243,4 +244,79 @@ def api_sounderpy_raob():
         max_age=3600,
         etag=True,
         conditional=True,
+    )
+
+
+@bp.route("/api/sounderpy/cache/status")
+def api_sounderpy_cache_status():
+    """Return cache status for the newest or requested cycle."""
+    cycle_arg = request.args.get("cycle", "").strip()
+    cycle = cycle_arg if cycle_arg else _resolve_cycle(None)
+    if not cycle:
+        return jsonify(
+            {
+                "cycle": None,
+                "station_count": 0,
+                "fhours_rendered": 0,
+                "total_pngs": 0,
+                "cache_mb": 0.0,
+                "oldest_cached": None,
+            }
+        ), 404
+
+    cycle_cache = os.path.join(CACHE_DIR, cycle)
+    station_files = {}
+    fhours_set = set()
+    total_bytes = 0
+    oldest_ts = None
+
+    if os.path.isdir(cycle_cache):
+        for fname in os.listdir(cycle_cache):
+            if not fname.endswith(".png"):
+                continue
+            # skewt_STATION_fXX.png  or  hodograph_STATION_fXX.png
+            parts = fname.split("_")
+            if len(parts) < 3:
+                continue
+            stn = parts[1]
+            fh_part = parts[-1].replace(".png", "")
+            station_files.setdefault(stn, []).append(fh_part)
+            fhours_set.add(fh_part)
+            fpath = os.path.join(cycle_cache, fname)
+            try:
+                total_bytes += os.path.getsize(fpath)
+                mtime = os.path.getmtime(fpath)
+                if oldest_ts is None or mtime < oldest_ts:
+                    oldest_ts = mtime
+            except OSError:
+                pass
+
+    # Separate K-stations from military / non-standard prefixes
+    k_stations = {s for s in station_files if s.startswith("K")}
+    # "complete" = at least 50 PNGs (29 fhours x 2 images minus some tolerance)
+    k_complete = [s for s in k_stations if len(station_files.get(s, [])) >= 50]
+    k_stations_partial = [s for s in k_stations if 0 < len(station_files.get(s, [])) < 50]
+
+    station_count = len(station_files)
+    k_station_count = len(k_stations)
+
+    fhours_rendered = len(fhours_set)
+    total_pngs = sum(len(v) for v in station_files.values())
+    cache_mb = round(total_bytes / 1048576, 2) if total_bytes else 0.0
+    oldest_cached = (
+        datetime.utcfromtimestamp(oldest_ts).isoformat() + "Z" if oldest_ts else None
+    )
+
+    return jsonify(
+        {
+            "cycle": cycle,
+            "station_count": station_count,
+            "k_station_count": k_station_count,
+            "k_stations_complete": len(k_complete),
+            "k_stations_partial": k_stations_partial,
+            "fhours_rendered": fhours_rendered,
+            "total_pngs": total_pngs,
+            "cache_mb": cache_mb,
+            "oldest_cached": oldest_cached,
+        }
     )
