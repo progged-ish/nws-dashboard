@@ -54,6 +54,10 @@ app = Flask(__name__)
 from sounderpy_routes import bp as sounderpy_bp
 app.register_blueprint(sounderpy_bp)
 
+# ── VILE Custom SOUNDERpy Plots Blueprint ─────────────────────────────────────
+from vile_plots_routes import bp as vile_plots_bp
+app.register_blueprint(vile_plots_bp)
+
 MPH_PER_KT = 1.15078
 
 # ── State Cache ───────────────────────────────────────────────────────────────
@@ -2738,8 +2742,14 @@ function buildGrid(stations, fhours) {
           if (ll != null && ll < 0) { hasInversion = true; break; }
         }
         const invClass = hasInversion ? ' inv-block' : '';
+        const skewtUrl = '/skewt?station=' + encodeURIComponent(s.station) + '&fh=' + encodeURIComponent(fh);
         h += '<div class="cell">';
+        h += '<a href="' + skewtUrl + '" title="Open Skew-T for ' + esc(s.station) + ' ' + fh + '"';
+        h += ' style="text-decoration:none"';
+        h += ' onclick="event.stopPropagation(); return true;"';
+        h += '>';
         h += '<span class="glyph-icon ' + cls + invClass + '">&#x27A4;</span>';
+        h += '</a>';
         // Tooltip: all 7 BTW layers with lapse rates
         h += '<div class="tip">';
         h += '<div class="tip-title">' + esc(s.station) + ' ' + esc(s.name) + ' f' + fh.replace('f','') + '</div>';
@@ -3224,10 +3234,22 @@ SKEWT_HTML = r'''
   .btn-group { display:flex; gap:6px; }
 
   .skewt-container {
-    display: flex; gap: 16px;
+    display: flex;
   }
-  .skewt-left { flex: 1; }
+  .skewt-left {
+    flex: 1;
+    display: flex;
+    gap: 16px;
+    flex-direction: row;
+  }
   .skewt-right { width: 320px; }
+  .skewt-img-col {
+    flex: 1 1 50%;
+    min-width: 0;
+  }
+  .skewt-img-col .sounder-img {
+    max-width: 100%;
+  }
 
   .panel {
     background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
@@ -3278,7 +3300,35 @@ SKEWT_HTML = r'''
   }
   .param-label { font-size: 0.65em; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase; }
   .param-value { font-size: 1.1em; font-weight: 700; color: var(--accent); margin-top: 2px; }
+  .param-value.na { color: var(--red); }
   .param-unit { font-size: 0.7em; color: var(--text-dim); font-weight: 400; }
+
+  /* Thermodynamic params pills beneath SkewT image */
+  .thermo-panel { margin-top: 16px; }
+  .thermo-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 8px;
+  }
+  .thermo-pill {
+    background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px 10px; text-align: center; transition: border-color 0.15s;
+  }
+  .thermo-pill:hover { border-color: var(--accent); }
+  .thermo-pill .lbl {
+    font-size: 0.6em; color: var(--text-dim); letter-spacing: 1px; text-transform: uppercase;
+  }
+  .thermo-pill .val {
+    font-size: 1.05em; font-weight: 700; color: var(--accent); margin-top: 2px;
+  }
+  .thermo-pill .val.na { color: var(--red); }
+  .thermo-pill .unit {
+    font-size: 0.65em; color: var(--text-dim); font-weight: 400;
+  }
+  .thermo-subgrid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px; margin-top: 4px;
+    font-size: 0.7em; color: var(--text-dim);
+  }
+  .thermo-subgrid span { display: block; }
+  .thermo-subgrid .sub-val { color: var(--accent); font-weight: 600; }
 
   .fh-slider { width: 100%; margin-top: 8px; }
   .fh-slider input[type=range] {
@@ -3308,6 +3358,7 @@ SKEWT_HTML = r'''
   <div class="topbar">
     <div class="topbar-left">
       <a href="/" class="back-link">◀ DASHBOARD</a>
+      <a href="/threats" class="back-link" style="margin-left:4px;">◀ THREATS</a>
       <span class="topbar-title">NAM SKEW-T</span>
       <span class="topbar-sub" id="cycleLabel">loading...</span>
     </div>
@@ -3345,13 +3396,26 @@ SKEWT_HTML = r'''
           <span class="panel-pill pill-info" id="soundingLabel">—</span>
         </div>
         <div class="panel-body">
-          <div class="skewt-img-wrap" id="imgWrap">
-            <img id="skewtImg" class="sounder-img" src="" alt="Skew-T">
-            <div class="skewt-spinner">RENDERING…</div>
+          <!-- Side-by-side Skew-T / Hodograph -->
+          <div class="skewt-img-col">
+            <div class="skewt-img-wrap" id="imgWrap">
+              <img id="skewtImg" class="sounder-img" src="" alt="Skew-T">
+              <div class="skewt-spinner">RENDERING…</div>
+            </div>
           </div>
-          <div class="skewt-img-wrap" id="hodoWrap" style="margin-top:16px;">
-            <img id="hodoImg" class="sounder-img" src="" alt="Hodograph">
-            <div class="skewt-spinner">RENDERING…</div>
+          <div class="skewt-img-col">
+            <div class="skewt-img-wrap" id="hodoWrap">
+              <img id="hodoImg" class="sounder-img" src="" alt="Hodograph">
+              <div class="skewt-spinner">RENDERING…</div>
+            </div>
+          </div>
+          <!-- Thermodynamic params overlay -->
+          <div class="thermo-panel" id="thermoPanel">
+            <div class="panel-head" style="margin:0 -16px 12px -16px; border-top:1px solid var(--border); border-radius:0;">
+              <h2>THERMO</h2>
+              <span class="panel-pill pill-info" id="thermoLabel">—</span>
+            </div>
+            <div class="thermo-grid" id="thermoGrid"></div>
           </div>
         </div>
       </div>
@@ -3512,6 +3576,85 @@ function selectFhour(key) {
       toggleLegacy(true);
     }
   }, 10000);
+
+  // Fetch computed thermodynamic params
+  fetchThermoParams();
+}
+
+// ── Thermodynamic Params Fetch ────────────────────────────────
+async function fetchThermoParams() {
+  if (!currentStation || !cycleInfo.cycle) return;
+  const cycle = (cycleInfo.cycle || '').replace(/ /g, '_');
+  const url = '/api/nam/params?station=' + encodeURIComponent(currentStation)
+    + '&cycle=' + encodeURIComponent(cycle)
+    + '&fh=' + encodeURIComponent(currentFhour);
+
+  const grid = document.getElementById('thermoGrid');
+  const label = document.getElementById('thermoLabel');
+  grid.innerHTML = '<div class="thermo-pill"><div class="lbl">LOADING</div><div class="val">…</div></div>';
+
+  try {
+    const resp = await fetch(url);
+    const data = await resp.json();
+
+    if (data._errors && Object.keys(data).length === 1) {
+      grid.innerHTML = '<div class="thermo-pill"><div class="lbl">ERROR</div><div class="val na">' + (data._errors.data || 'Failed') + '</div></div>';
+      label.textContent = 'ERR';
+      return;
+    }
+
+    label.textContent = currentFhour.toUpperCase();
+
+    const defs = [
+      {key:'sbcape', label:'SBCAPE', unit:'J/kg', fmt:v=>Math.round(v)},
+      {key:'mlcape', label:'MLCAPE', unit:'J/kg', fmt:v=>Math.round(v)},
+      {key:'mucape', label:'MUCAPE', unit:'J/kg', fmt:v=>Math.round(v)},
+      {key:'sbcin',  label:'SBCIN',  unit:'J/kg', fmt:v=>Math.round(v)},
+      {key:'mlcin',  label:'MLCIN',  unit:'J/kg', fmt:v=>Math.round(v)},
+      {key:'mucin',  label:'MUCIN',  unit:'J/kg', fmt:v=>Math.round(v)},
+      {key:'lcl',    label:'LCL',    unit:'hPa',  fmt:v=>Math.round(v)},
+      {key:'lfc',    label:'LFC',    unit:'hPa',  fmt:v=>Math.round(v)},
+      {key:'el',     label:'EL',     unit:'hPa',  fmt:v=>Math.round(v)},
+      {key:'pwat',   label:'PWAT',   unit:'in',   fmt:v=>v.toFixed(2)},
+      {key:'shear_0_1km', label:'0-1km SHR', unit:'kt', fmt:v=>Math.round(v)},
+      {key:'shear_0_3km', label:'0-3km SHR', unit:'kt', fmt:v=>Math.round(v)},
+      {key:'shear_0_6km', label:'0-6km SHR', unit:'kt', fmt:v=>Math.round(v)},
+      {key:'srh_0_1km',   label:'0-1km SRH', unit:'m²/s²', fmt:v=>Math.round(v)},
+      {key:'srh_0_3km',   label:'0-3km SRH', unit:'m²/s²', fmt:v=>Math.round(v)},
+      {key:'lapse_sfc_500', label:'SFC-500 LR', unit:'°C/km', fmt:v=>v.toFixed(1)},
+      {key:'lapse_700_500', label:'700-500 LR', unit:'°C/km', fmt:v=>v.toFixed(1)},
+      {key:'lapse_850_700', label:'850-700 LR', unit:'°C/km', fmt:v=>v.toFixed(1)},
+      {key:'li',     label:'LI',     unit:'°C',   fmt:v=>v.toFixed(1)},
+      {key:'tt',     label:'TT',     unit:'',     fmt:v=>Math.round(v)},
+    ];
+
+    grid.innerHTML = '';
+    defs.forEach(d => {
+      const has = data.hasOwnProperty(d.key) && data[d.key] !== null && data[d.key] !== undefined;
+      const val = has ? d.fmt(data[d.key]) : 'N/A';
+      const naCls = has ? '' : ' na';
+      const div = document.createElement('div');
+      div.className = 'thermo-pill';
+      div.innerHTML = '<div class="lbl">' + d.label + '</div>' +
+        '<div class="val' + naCls + '">' + val + '</div>' +
+        '<div class="unit">' + d.unit + '</div>';
+      grid.appendChild(div);
+    });
+
+    // Show any param-level errors in a tiny sub-grid
+    if (data._errors) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'thermo-pill';
+      errDiv.style.gridColumn = '1 / -1';
+      errDiv.innerHTML = '<div class="lbl">WARN</div><div class="thermo-subgrid">' +
+        Object.entries(data._errors).map(([k,v]) => '<span>' + k + ': <span class="sub-val">' + v + '</span></span>').join('') +
+        '</div>';
+      grid.appendChild(errDiv);
+    }
+  } catch (err) {
+    grid.innerHTML = '<div class="thermo-pill"><div class="lbl">ERROR</div><div class="val na">Fetch failed</div></div>';
+    label.textContent = 'ERR';
+  }
 }
 
 // ── Legacy toggle ─────────────────────────────────────────────
@@ -3803,10 +3946,22 @@ DASHBOARD_HTML = r'''
   .btn.active { background: rgba(56,189,248,0.12); border-color: var(--accent); color: var(--accent); }
 
   .skewt-container {
-    display: flex; gap: 16px;
+    display: flex;
   }
-  .skewt-left { flex: 1; }
+  .skewt-left {
+    flex: 1;
+    display: flex;
+    gap: 16px;
+    flex-direction: row;
+  }
   .skewt-right { width: 320px; }
+  .skewt-img-col {
+    flex: 1 1 50%;
+    min-width: 0;
+  }
+  .skewt-img-col .sounder-img {
+    max-width: 100%;
+  }
 
   .panel {
     background: var(--bg-panel); border: 1px solid var(--border); border-radius: 8px;
@@ -3870,6 +4025,7 @@ DASHBOARD_HTML = r'''
   <div class="topbar">
     <div class="topbar-left">
       <a href="/" class="back-link">◀ DASHBOARD</a>
+      <a href="/threats" class="back-link" style="margin-left:4px;">◀ THREATS</a>
       <span class="topbar-title">NAM SKEW-T</span>
       <span class="topbar-sub" id="cycleLabel">loading...</span>
     </div>

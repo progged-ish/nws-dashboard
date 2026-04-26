@@ -16,6 +16,7 @@ pip-delete-this-directory.txt
 nohup.out
 dashboard.pid
 logs/
+test_output/
 
 # Data files
 *.grib2

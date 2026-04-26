@@ -24,6 +24,26 @@ Previous session crashed mid-task, but the collapsible section changes were alre
 - Dashboard serving at localhost:5000
 - Collapsible sections functional on both panels
 
+## 2026-04-26 — VILE SOUNDERpy Custom Plots Phase 4 Complete
+
+All 5 phases of the custom Skew-T/hodograph fork are now locked. No further edits expected to `custom_skewt.py`.
+
+### What changed (Session 11)
+
+- **Full QA cycle:** Both `qa_runner.py` (synthetic) and `qa_runner_real_venv.py` (OUN RAOB) pass with exit code 0
+- **Numerical regression:** All verified params match baseline to 0.00 deviation:
+  - SBCAPE 644.49, MUCAPE 644.49, MLCAPE 425.90, MLCIN -269.90, DCAPE 1093.67, Γ₀₋₃ 4.99, Γ₃₋₆ 7.90
+- **Vision check:** No visual regressions. CAPE/CIN shading visible. No bold/shouting text. No clipping.
+- **Dashboard snapshot:** Copies placed in `nws_dashboard/test_output/`
+  - `custom_skewt_v11.png`, `custom_hodo_v11.png`, `custom_hodo_sr_v11.png`
+
+### Session resume prompt
+
+Updated: `/mnt/d/session_9_resume_prompt.md` — all phases marked COMPLETE.
+
+### Status
+- `custom_skewt.py` locked. Defer `custom_hodo.py` enhancements until Skew-T integration into dashboard begins.
+
 ## 2026-04-15 — cfgrib Wind Data Bug Fix
 
 All isobaric wind components (u_ms, v_ms) were `None` in 20260415 12z profiles. Without wind data, BTW (Best Transfer Winds) couldn't compute, so no threat icons rendered.
