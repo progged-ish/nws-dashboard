@@ -2742,7 +2742,10 @@ function buildGrid(stations, fhours) {
           if (ll != null && ll < 0) { hasInversion = true; break; }
         }
         const invClass = hasInversion ? ' inv-block' : '';
-        const skewtUrl = '/skewt?station=' + encodeURIComponent(s.station) + '&fh=' + encodeURIComponent(fh);
+        const cycleVal = rawData?.info?.cycle || '';
+        const skewtUrl = '/vile/custom-skewt-hodo?station=' + encodeURIComponent(s.station)
+          + '&fh=' + encodeURIComponent(fh)
+          + '&cycle=' + encodeURIComponent(cycleVal);
         h += '<div class="cell">';
         h += '<a href="' + skewtUrl + '" title="Open Skew-T for ' + esc(s.station) + ' ' + fh + '"';
         h += ' style="text-decoration:none"';
