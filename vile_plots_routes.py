@@ -360,6 +360,7 @@ main {
     </label>
     <button class="primary" onclick="updateMotion()">↻ Reload</button>
     <a href="/">← Dashboard</a>
+    <a href="/threats">◀ THREATS</a>
   </div>
 </header>
 
